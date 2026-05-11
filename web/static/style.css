@@ -1,0 +1,91 @@
+/* HardTech Writer — Custom Styles */
+
+/* Smooth transitions for sections */
+section {
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* Pulse animation for active step indicator */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+.animate-pulse {
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+/* Progress bar transition */
+#progress-bar {
+  transition: width 0.5s ease;
+}
+
+/* Verbose log terminal style */
+#verbose-log {
+  font-family: 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', monospace;
+  scrollbar-width: thin;
+  scrollbar-color: #4b5563 transparent;
+}
+#verbose-log::-webkit-scrollbar {
+  width: 6px;
+}
+#verbose-log::-webkit-scrollbar-track {
+  background: transparent;
+}
+#verbose-log::-webkit-scrollbar-thumb {
+  background-color: #4b5563;
+  border-radius: 3px;
+}
+
+/* Toast animation */
+#toast {
+  animation: slide-up 0.3s ease;
+}
+@keyframes slide-up {
+  from { transform: translateY(20px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+/* Details/summary arrow rotation */
+details[open] summary::after {
+  transform: rotate(90deg);
+}
+details summary::after {
+  content: '';
+  display: inline-block;
+  transition: transform 0.2s ease;
+}
+
+/* Focus ring override for inputs */
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.5);
+}
+
+/* Link input validation red border */
+.inp-link:invalid {
+  border-color: #ef4444;
+}
+
+/* Disabled button cursor */
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* History item hover */
+#history-list > div:hover {
+  background-color: #f9fafb;
+}
+
+/* Responsive adjustments */
+@media (max-width: 640px) {
+  .max-w-3xl {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+  #model-panel {
+    right: 1rem;
+    width: calc(100vw - 2rem);
+    max-width: 20rem;
+  }
+}

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HardTech Writer</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <!-- 认证弹窗 -->
+  <div id="auth-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 hidden">
+    <div class="bg-white rounded-xl p-8 shadow-2xl max-w-sm w-full mx-4">
+      <h2 class="text-xl font-bold mb-4 text-gray-800">🔐 输入访问密钥</h2>
+      <input id="auth-key" type="password" placeholder="Access Key"
+             class="w-full border border-gray-300 rounded-lg px-4 py-3 mb-4 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none">
+      <button onclick="doAuth()" class="w-full bg-blue-600 text-white rounded-lg py-3 font-medium hover:bg-blue-700 transition">确认</button>
+      <p id="auth-error" class="text-red-500 text-sm mt-2 hidden"></p>
+    </div>
+  </div>
+
+  <!-- 模型配置面板 -->
+  <div id="model-panel" class="fixed top-14 right-4 bg-white rounded-xl shadow-2xl border p-4 z-40 w-80 hidden">
+    <h3 class="font-bold text-gray-700 mb-3">API 配置</h3>
+    <label class="text-xs text-gray-500">Base URL</label>
+    <input id="cfg-base-url" class="w-full border rounded px-3 py-2 mb-2 text-sm" placeholder="https://yunwu.ai/v1/chat/completions">
+    <label class="text-xs text-gray-500">API Key</label>
+    <input id="cfg-api-key" type="password" class="w-full border rounded px-3 py-2 mb-2 text-sm" placeholder="sk-...">
+    <label class="text-xs text-gray-500">Model</label>
+    <input id="cfg-model" class="w-full border rounded px-3 py-2 mb-3 text-sm" placeholder="gemini-3.1-flash-lite-preview">
+    <button onclick="saveApiConfig()" class="w-full bg-gray-800 text-white rounded py-2 text-sm hover:bg-gray-700">保存配置</button>
+  </div>
+
+  <!-- 主容器 -->
+  <div class="max-w-3xl mx-auto px-4 py-8">
+    <!-- 顶栏 -->
+    <header class="flex items-center justify-between mb-8">
+      <h1 class="text-2xl font-bold text-gray-800">HardTech Writer</h1>
+      <div class="flex items-center gap-2">
+        <span id="current-model" class="text-sm text-gray-500 bg-gray-100 px-3 py-1 rounded-full cursor-pointer hover:bg-gray-200 transition" onclick="toggleModelPanel()">
+          loading...
+        </span>
+        <button onclick="toggleModelPanel()" class="text-gray-400 hover:text-gray-600 p-1">⚙️</button>
+      </div>
+    </header>
+
+    <!-- 素材输入区 -->
+    <section id="input-section" class="bg-white rounded-xl shadow-sm border p-6 mb-6">
+      <h2 class="font-bold text-gray-700 mb-4">素材输入 <span class="text-xs text-gray-400 font-normal">（至少填写一项）</span></h2>
+
+      <label class="text-sm text-gray-600 mb-1 block">关键词</label>
+      <input id="inp-keywords" class="w-full border rounded-lg px-4 py-2.5 mb-3 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+             placeholder="如：CoWoS 先进封装 台积电">
+
+      <label class="text-sm text-gray-600 mb-1 block">文章大纲 <span class="text-gray-400">（每行一个方向）</span></label>
+      <textarea id="inp-outline" rows="3" class="w-full border rounded-lg px-4 py-2.5 mb-3 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none resize-none"
+                placeholder="产业背景&#10;技术路径拆解&#10;竞争格局分析&#10;投资逻辑"></textarea>
+
+      <label class="text-sm text-gray-600 mb-1 block">大致思路</label>
+      <textarea id="inp-ideas" rows="2" class="w-full border rounded-lg px-4 py-2.5 mb-3 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none resize-none"
+                placeholder="如：分析台积电 CoWoS 产能扩张对封测产业链的影响"></textarea>
+
+      <label class="text-sm text-gray-600 mb-1 block">线索文章链接</label>
+      <div id="links-container" class="mb-3">
+        <div class="flex gap-2 mb-2">
+          <input class="inp-link flex-1 border rounded-lg px-4 py-2.5 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                 placeholder="https://example.com/article">
+          <button onclick="addLinkInput()" class="px-3 py-2 bg-gray-100 rounded-lg hover:bg-gray-200 text-gray-600">+</button>
+        </div>
+      </div>
+
+      <div class="mb-4">
+        <button onclick="fillExample()" class="text-sm text-blue-500 hover:text-blue-700">💡 试试：一键填入示例</button>
+      </div>
+
+      <!-- 文风参考 -->
+      <h3 class="font-bold text-gray-700 mb-3 mt-2">文风参考</h3>
+      <div class="space-y-2 mb-4">
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" name="style-mode" value="existing" checked onchange="switchStyleMode()" class="accent-blue-600">
+          <span class="text-sm text-gray-600">选择已有风格</span>
+          <select id="style-existing" class="border rounded px-3 py-1.5 text-sm ml-2 focus:ring-2 focus:ring-blue-500 outline-none">
+            <option value="">加载中...</option>
+          </select>
+        </label>
+        <label class="flex items-start gap-2 cursor-pointer">
+          <input type="radio" name="style-mode" value="text" onchange="switchStyleMode()" class="accent-blue-600 mt-1">
+          <span class="text-sm text-gray-600">粘贴参考文本</span>
+        </label>
+        <textarea id="style-text" rows="3" class="w-full border rounded-lg px-4 py-2.5 ml-6 hidden focus:ring-2 focus:ring-blue-500 outline-none resize-none"
+                  placeholder="粘贴一段你想要模仿风格的文章段落..."></textarea>
+        <label class="flex items-center gap-2 cursor-pointer">
+          <input type="radio" name="style-mode" value="link" onchange="switchStyleMode()" class="accent-blue-600">
+          <span class="text-sm text-gray-600">粘贴参考链接</span>
+        </label>
+        <input id="style-link" class="w-full border rounded-lg px-4 py-2.5 ml-6 hidden focus:ring-2 focus:ring-blue-500 outline-none"
+               placeholder="https://example.com/reference-article">
+      </div>
+
+      <!-- 高级选项 -->
+      <details class="mb-4">
+        <summary class="text-sm text-gray-500 cursor-pointer hover:text-gray-700">高级选项 ▶</summary>
+        <div class="mt-3 pl-4 space-y-2">
+          <label class="flex items-center gap-2">
+            <span class="text-sm text-gray-600 w-20">章节数量</span>
+            <select id="adv-chapters" class="border rounded px-2 py-1 text-sm">
+              <option value="3">3 章</option>
+              <option value="4" selected>4 章</option>
+              <option value="5">5 章</option>
+            </select>
+          </label>
+        </div>
+      </details>
+
+      <button id="btn-write" onclick="startWriting()" disabled
+              class="w-full bg-blue-600 text-white rounded-lg py-3 font-medium hover:bg-blue-700 transition disabled:bg-gray-300 disabled:cursor-not-allowed">
+        🚀 开始写作
+      </button>
+    </section>
+
+    <!-- 写作进度区 -->
+    <section id="progress-section" class="bg-white rounded-xl shadow-sm border p-6 mb-6 hidden">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="font-bold text-gray-700">写作进度</h2>
+        <div class="flex items-center gap-1 bg-gray-100 rounded-lg p-0.5">
+          <button id="btn-simple" onclick="setLogMode('simple')" class="px-3 py-1 text-xs rounded-md bg-white shadow-sm font-medium">简洁</button>
+          <button id="btn-verbose" onclick="setLogMode('verbose')" class="px-3 py-1 text-xs rounded-md text-gray-500 hover:text-gray-700">详细</button>
+        </div>
+      </div>
+
+      <!-- 简洁模式 -->
+      <div id="log-simple" class="space-y-2">
+        <div id="simple-steps"></div>
+        <div class="mt-3">
+          <div class="w-full bg-gray-200 rounded-full h-2">
+            <div id="progress-bar" class="bg-blue-600 h-2 rounded-full transition-all" style="width: 0%"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 详细模式 -->
+      <div id="log-verbose" class="hidden">
+        <div id="verbose-log" class="bg-gray-900 text-gray-300 rounded-lg p-4 max-h-64 overflow-y-auto font-mono text-xs leading-relaxed"></div>
+      </div>
+    </section>
+
+    <!-- 成文区 -->
+    <section id="result-section" class="bg-white rounded-xl shadow-sm border p-6 mb-6 hidden">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="font-bold text-gray-700">成文</h2>
+        <span id="result-stats" class="text-sm text-gray-500"></span>
+      </div>
+
+      <textarea id="article-editor" rows="20"
+                class="w-full border rounded-lg px-4 py-3 mb-4 focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none resize-y leading-relaxed"></textarea>
+
+      <div class="flex flex-wrap gap-2 mb-4">
+        <button onclick="saveEdit()" class="px-4 py-2 bg-green-600 text-white rounded-lg text-sm hover:bg-green-700">💾 保存</button>
+        <button onclick="showEmailModal()" class="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700">📧 发送邮件</button>
+        <button onclick="copyArticle()" class="px-4 py-2 bg-gray-600 text-white rounded-lg text-sm hover:bg-gray-700">📋 复制</button>
+        <button onclick="resetForm()" class="px-4 py-2 bg-orange-500 text-white rounded-lg text-sm hover:bg-orange-600">🔄 重新生成</button>
+      </div>
+
+      <!-- 素材来源 -->
+      <div id="sources-section" class="hidden">
+        <h3 class="font-bold text-gray-700 mb-2 text-sm">📚 本次参考素材</h3>
+        <div id="sources-list" class="space-y-1"></div>
+      </div>
+    </section>
+
+    <!-- 历史记录 -->
+    <section id="history-section" class="bg-white rounded-xl shadow-sm border p-6 mb-6">
+      <h2 class="font-bold text-gray-700 mb-4">历史记录</h2>
+      <div id="history-list" class="space-y-2">
+        <p class="text-sm text-gray-400">暂无记录</p>
+      </div>
+    </section>
+  </div>
+
+  <!-- 邮件弹窗 -->
+  <div id="email-modal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50 hidden">
+    <div class="bg-white rounded-xl p-6 shadow-2xl max-w-md w-full mx-4">
+      <h3 class="font-bold text-gray-800 mb-4">📧 发送邮件</h3>
+      <label class="text-sm text-gray-600 mb-1 block">收件人</label>
+      <input id="email-recipient" class="w-full border rounded-lg px-4 py-2.5 mb-3 focus:ring-2 focus:ring-blue-500 outline-none"
+             placeholder="team@company.com">
+      <label class="text-sm text-gray-600 mb-1 block">邮件主题</label>
+      <input id="email-subject" class="w-full border rounded-lg px-4 py-2.5 mb-4 focus:ring-2 focus:ring-blue-500 outline-none">
+      <div class="flex gap-2 justify-end">
+        <button onclick="closeEmailModal()" class="px-4 py-2 text-gray-600 hover:text-gray-800">取消</button>
+        <button onclick="doSendEmail()" class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">确认发送</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="fixed bottom-4 right-4 bg-gray-800 text-white px-4 py-2 rounded-lg shadow-lg text-sm hidden z-50"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

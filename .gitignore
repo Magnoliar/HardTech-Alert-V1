@@ -1,0 +1,35 @@
+# 运行时状态
+angle_history.json
+simhash_history.json
+topic_history.json
+dynamic_keywords.json
+source_health.json
+strategic_memory.json
+.task_state.json
+.task_state_v2.json
+
+# 敏感信息
+config.ini
+.env
+
+# 运行产物
+run_log.txt
+*-Raw.json
+*-Clean.json
+knowledge_base/
+archive/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# Web 部署
+web/.env
+web/data/
+web/certs/

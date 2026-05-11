@@ -1,0 +1,16 @@
+[project]
+name = "hardtech-alert"
+version = "1.0.0"
+description = "多源硬科技产业情报采集 × AI深度分析 × 自动化内容生成系统"
+requires-python = ">=3.10"
+readme = "README.md"
+license = {text = "MIT"}
+
+dependencies = [
+    "requests>=2.31.0",
+    "simhash>=2.1.2",
+    "rich>=13.0",
+]
+
+[project.scripts]
+alert = "main:main"
