@@ -1,4 +1,5 @@
 """公共文本处理工具 — 黑话替换 + 物理净化"""
+import re
 import logging
 from llm_client import call_ai_api
 
@@ -13,11 +14,23 @@ BUZZWORD_REPLACER = {
 
 
 def surgical_purify(text):
-    """黑话物理替换 + humanizer 轻度净化"""
+    """黑话物理替换 + 标点清理 + humanizer 轻度净化"""
     if not text:
         return ""
     for old, new in BUZZWORD_REPLACER.items():
         text = text.replace(old, new)
+
+    # 双标点清理
+    text = re.sub(r'。。+', '。', text)
+    text = re.sub(r'，，+', '，', text)
+    text = re.sub(r'！！+', '！', text)
+    text = re.sub(r'？？+', '？', text)
+    text = re.sub(r'[，,]\s*[，,]+', '，', text)
+    # 句尾双句号
+    text = re.sub(r'。。\s*$', '。', text, flags=re.MULTILINE)
+    # 连续句号散布在文中
+    text = re.sub(r'。\s*。', '。', text)
+
     try:
         from humanizer_plugin import HumanizerPlugin
         text = HumanizerPlugin.purify(text, intensity="light")

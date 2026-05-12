@@ -5,6 +5,9 @@ topic_history.json
 dynamic_keywords.json
 source_health.json
 strategic_memory.json
+fact_archive.json
+.data_hash.json
+.alert_sent_today.json
 .task_state.json
 .task_state_v2.json
 
@@ -16,6 +19,7 @@ config.ini
 run_log.txt
 *-Raw.json
 *-Clean.json
+*-top_news.json
 knowledge_base/
 archive/
 

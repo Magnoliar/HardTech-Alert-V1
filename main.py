@@ -1,5 +1,6 @@
 # main.py — 多源硬科技情报系统主入口
 import os
+import argparse
 import logging
 import logging.handlers
 import shutil
@@ -51,6 +52,11 @@ def archive_files(file_paths):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=f"{DOMAIN['brand']} 多源硬科技情报系统")
+    parser.add_argument('--skip-score', action='store_true', help='跳过阶段3评分，直接用今日 Clean.json 进入选题+写作')
+    parser.add_argument('--article-only', action='store_true', help='跳过阶段1-3，直接用已有的 top_news 数据写特稿')
+    args = parser.parse_args()
+
     brand = DOMAIN['brand']
     brand_emoji = DOMAIN['brand_emoji']
     start_time = time.time()
@@ -82,14 +88,89 @@ def main():
     ))
     logger.info(f"{brand_emoji} {brand} 启动 ({datetime.now().strftime('%Y-%m-%d %H:%M')})")
 
-    load_config()
+    config = load_config()
 
     today_str = datetime.now().strftime('%Y-%m-%d')
     _dir = os.path.dirname(os.path.abspath(__file__))
     raw_json = os.path.join(_dir, f"{today_str}-Raw.json")
     clean_json = os.path.join(_dir, f"{today_str}-Clean.json")
+    top_news_file = os.path.join(_dir, f"{today_str}-top_news.json")
 
     json_to_process = None
+
+    # --article-only 模式：跳过阶段 1-3，直接用缓存的 top_news
+    if args.article_only:
+        if not os.path.exists(top_news_file):
+            console.print(f"[red]未找到缓存的 top_news: {os.path.basename(top_news_file)}[/red]")
+            console.print("[red]请先正常运行一次，或去掉 --article-only 参数。[/red]")
+            return
+        console.print(f"  [green]✓ 加载缓存 top_news[/green] {os.path.basename(top_news_file)}")
+        with open(top_news_file, 'r', encoding='utf-8') as f:
+            top_news = json.load(f)
+        metrics['selected_count'] = len(top_news)
+        scores = [n.get('parsed', {}).get('score', 0) for n in top_news]
+        metrics['top_score'] = max(scores) if scores else 0
+        metrics['low_score'] = min(scores) if scores else 0
+        console.print(f"  [dim]跳过阶段 1-3，直接进入选题+写作[/dim]")
+        # 跳到阶段 4
+        json_to_process = None  # 标记跳过常规流程
+        # 直接进入阶段 4 写作
+        console.print()
+        console.print("[bold cyan][4/5][/bold cyan] ✍️  深度特稿")
+        pipeline_version = config.app_settings.get('writing_pipeline', 'v2')
+        console.print(f"  [dim]写作管线: {pipeline_version}[/dim]")
+        console.print("  ⏳ AI 选题规划中...")
+        if pipeline_version == 'v3':
+            from angle_engine_v3 import AngleEngineV3
+            engine = AngleEngineV3()
+        else:
+            engine = AngleEngine()
+        topic = engine.select_and_plan(top_news)
+        if topic:
+            metrics['angle'] = topic.get('selected_angle', '')
+            metrics['topic'] = topic.get('title_proposal', '')
+            thesis = topic.get('thesis', '')
+            if thesis:
+                console.print(f"  [green]✓ 论点:[/green] [bold]{thesis[:60]}...[/bold]")
+            console.print(f"  [green]✓ 选题:[/green] [bold]{metrics['topic']}[/bold]")
+            console.print(f"  [green]✓ 视角:[/green] [dim]{metrics['angle']}[/dim]")
+            outline = topic.get('outline', [])
+            console.print(f"  ⏳ 写作中 ({len(outline)} 章节)...")
+            if pipeline_version == 'v3':
+                from article_writer_v3 import ArticleWriterV3
+                deep_writer = ArticleWriterV3()
+            else:
+                from article_writer_v2 import ArticleWriterV2
+                deep_writer = ArticleWriterV2()
+            deep_writer.run(topic, top_news)
+            metrics['article_generated'] = True
+            console.print("  [green]✓ 特稿已生成、归档并发送[/green]")
+        else:
+            console.print("  [yellow]选题失败[/yellow]")
+        # 归档
+        console.print()
+        console.print("[bold cyan][5/5][/bold cyan] 📧 收尾")
+        console.print("  ⏳ 归档数据...")
+        archive_files([raw_json, clean_json])
+        console.print("  [green]✓ 数据已归档[/green]")
+        # 运行报告
+        elapsed = time.time() - start_time
+        elapsed_str = f"{int(elapsed//60)}分{int(elapsed%60)}秒"
+        table = Table(title="运行报告", border_style="cyan", show_lines=False, padding=(0, 2))
+        table.add_column("项目", style="dim", no_wrap=True)
+        table.add_column("结果", style="bold")
+        table.add_row("模式", "[yellow]--article-only[/yellow]")
+        table.add_row("耗时", elapsed_str)
+        if metrics['selected_count']:
+            table.add_row("入选", f"{metrics['selected_count']} 条")
+        if metrics['topic']:
+            table.add_row("选题", metrics['topic'])
+        if metrics['article_generated']:
+            table.add_row("特稿", "[green]已生成[/green]")
+        console.print()
+        console.print(table)
+        console.print()
+        return
 
     # --- 阶段 1/5 · 多源采集 ---
     console.print()
@@ -162,14 +243,23 @@ def main():
         console.print()
         console.print("[bold cyan][3/5][/bold cyan] 🤖 AI 评分筛选")
 
-        def _ai_progress(batch_num, total, matched):
-            console.print(f"  ⏳ 批次 {batch_num}/{total} 完成 (已匹配 {matched} 条)")
+        if args.skip_score and os.path.exists(top_news_file):
+            console.print(f"  [yellow]--skip-score: 加载缓存 top_news[/yellow] {os.path.basename(top_news_file)}")
+            logger.info(f"--skip-score: 加载缓存 top_news: {top_news_file}")
+            with open(top_news_file, 'r', encoding='utf-8') as f:
+                top_news = json.load(f)
+        else:
+            if args.skip_score:
+                console.print("  [yellow]缓存 top_news 不存在，回退到正常评分[/yellow]")
 
-        top_news = AI.process_and_send_alerts(json_to_process, progress_callback=_ai_progress)
+            def _ai_progress(batch_num, total, matched):
+                console.print(f"  ⏳ 批次 {batch_num}/{total} 完成 (已匹配 {matched} 条)")
+
+            top_news = AI.process_and_send_alerts(json_to_process, progress_callback=_ai_progress)
 
         if top_news:
             metrics['selected_count'] = len(top_news)
-            scores = [n['parsed'].get('score', 0) for n in top_news]
+            scores = [n.get('parsed', {}).get('score', 0) for n in top_news]
             metrics['top_score'] = max(scores) if scores else 0
             metrics['low_score'] = min(scores) if scores else 0
             console.print(f"  入选 [bold]{len(top_news)}[/bold] 条 | 最高分 [bold red]{metrics['top_score']}[/bold red] | 最低分 [bold]{metrics['low_score']}[/bold]")
@@ -229,13 +319,14 @@ def main():
         except Exception as es:
             logger.error(f"周期性报告生成失败: {es}")
 
-        console.print("  ⏳ 归档数据...")
-        archive_files([raw_json, clean_json])
-        console.print("  [green]✓ 数据已归档[/green]")
-
     except Exception as e:
         console.print(f"[bold red]执行异常:[/bold red] {e}")
         logger.exception(f"执行异常: {e}")
+
+    # --- 归档（无论评分/写作是否成功，都归档原始数据）---
+    console.print("  ⏳ 归档数据...")
+    archive_files([raw_json, clean_json])
+    console.print("  [green]✓ 数据已归档[/green]")
 
     # --- 运行报告 ---
     elapsed = time.time() - start_time

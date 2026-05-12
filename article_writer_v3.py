@@ -5,6 +5,7 @@ import logging
 import random
 import hashlib
 import requests
+from difflib import SequenceMatcher
 from datetime import datetime
 from config_loader import load_config
 from llm_client import call_ai_api, extract_json_from_text, emit_event
@@ -270,14 +271,19 @@ class ArticleWriterV3:
         if current_chapter_idx < 2:
             return context_summary
 
-        # 压缩 claims：最多保留 15 条最近的
+        # 压缩 claims：最多保留 25 条最近的，丢弃的生成摘要注入 logic
         claims = entities.get("claims", [])
-        if len(claims) > 15:
-            entities["claims"] = claims[-15:]
+        if len(claims) > 25:
+            discarded = claims[:len(claims)-25]
+            digest = "；".join(c[:40] for c in discarded[-5:])
+            logic = f"[前文已论述要点]{digest}。" + logic
+            entities["claims"] = claims[-25:]
 
-        # 压缩 logic：截断到最近 800 字
-        if len(logic) > 800:
-            context_summary["logic"] = "..." + logic[-800:]
+        # 压缩 logic：截断到最近 1200 字
+        if len(logic) > 1200:
+            context_summary["logic"] = "..." + logic[-1200:]
+        else:
+            context_summary["logic"] = logic
 
         # 压缩 unresolved_threads：保留最近 5 条
         unresolved = entities.get("unresolved_threads", [])
@@ -424,18 +430,17 @@ class ArticleWriterV3:
         # 去空、去短
         return sorted([e for e in entities if e and len(e) > 1])
 
-    def _build_chapter_sys_prompt(self, i, total_chapters, context_summary, thesis, narrative_thread, outline, template_inject=""):
+    def _build_chapter_sys_prompt(self, i, total_chapters, context_summary, thesis, narrative_thread, outline, template_inject="", chapter_style=None):
         """#6 分层 prompt 架构 + #7 尾部清单 + #8 标准名 + #9 偏离警告 + #16 模板注入"""
         logic = context_summary.get("logic", "") if isinstance(context_summary, dict) else str(context_summary)
         last_words = self.state.get('chapters_done', [])
         last_words = last_words[-1][-300:] if last_words else "这是文章的开篇。"
 
-        # 前序章节事实
+        # 前序章节事实（保留最近 3 章）
         prev_facts = ""
-        if len(self.chapter_facts_pool) >= 2:
-            prev_facts = f"【前序章节核心事实】\n{self.chapter_facts_pool[-2]}\n{self.chapter_facts_pool[-1]}\n\n"
-        elif self.chapter_facts_pool:
-            prev_facts = f"【前序章节核心事实】\n{self.chapter_facts_pool[-1]}\n\n"
+        recent_facts = self.chapter_facts_pool[-3:] if self.chapter_facts_pool else []
+        if recent_facts:
+            prev_facts = f"【前序章节核心事实】\n" + "\n".join(recent_facts) + "\n\n"
 
         # 反驳观点
         counter = self.state.get('counter_argument', '')
@@ -485,6 +490,9 @@ class ArticleWriterV3:
 ```
 这个标记必须输出，否则系统无法追踪进度。"""
 
+        # B5: 优先使用章节推荐风格，否则用默认风格
+        active_style = chapter_style if chapter_style else self.style
+
         # #6 XML 分层 prompt 架构
         sys_p = f"""你是一位拥有十几年经验的顶尖硬科技产业特稿主笔。今天是 {self.today_str}。
 
@@ -499,11 +507,11 @@ class ArticleWriterV3:
 {entity_registry}
 {warnings_section}
 <style_guide role="style_constraint" priority="highest">
-行文风格：《{self.style['name']}》：{self.style['persona']}
+行文风格：《{active_style['name']}》：{active_style['persona']}
 风格DNA锚点（严格模仿此段的语感、句式和信息密度）：
-{self.style.get('dna_sample', '')}
+{active_style.get('dna_sample', '')}
 结构节奏指引（全篇宏观节奏应遵循此路径，但不要写出这些标签）：
-{self.style.get('structure', '')}
+{active_style.get('structure', '')}
 </style_guide>
 
 <task_context role="primary_directive" priority="high">
@@ -528,6 +536,469 @@ class ArticleWriterV3:
 </tail_checklist>"""
 
         return sys_p, prev_facts, last_words
+
+    def _review_and_adjust_outline(self, chapter_text, outline, thesis):
+        """B1 骨架审稿：写完第1章后，LLM审查质量并动态修正后续大纲"""
+        logger.info("🔍 B1 骨架审稿: 第1章完成后审查...")
+        remaining = outline[1:]  # 后续章节
+
+        prompt = f"""你是一位资深主编，刚刚收到一篇深度产业分析文章的第1章。请审查第1章的质量，并决定后续大纲是否需要调整。
+
+【第1章内容】
+{chapter_text[:3000]}
+
+【中心论点】
+{thesis}
+
+【原定后续大纲】
+{json.dumps(remaining, ensure_ascii=False)}
+
+请严格输出JSON：
+{{
+    "verdict": "pass 或 adjust",
+    "reason": "判断理由（1-2句话）",
+    "adjusted_outline": ["修正后的后续章节标题列表，如果 verdict=pass 则与原大纲相同"],
+    "chapter1_quality": {{
+        "thesis_established": true 或 false,
+        "evidence_strength": "strong/medium/weak",
+        "opening_hook": "strong/medium/weak"
+    }}
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是严格的产业文章审稿人。只输出JSON，不要解释。"},
+            {"role": "user", "content": prompt}
+        ], description="B1 Skeleton Review")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result:
+                verdict = result.get("verdict", "pass")
+                quality = result.get("chapter1_quality", {})
+                logger.info(
+                    f"🔍 B1 审稿结果: {verdict} | "
+                    f"论点确立: {quality.get('thesis_established', '?')} | "
+                    f"证据力度: {quality.get('evidence_strength', '?')} | "
+                    f"开篇吸引力: {quality.get('opening_hook', '?')}"
+                )
+                if verdict == "adjust":
+                    adjusted = result.get("adjusted_outline", remaining)
+                    reason = result.get("reason", "")
+                    logger.info(f"🔧 B1 大纲修正: {reason}")
+                    return [outline[0]] + adjusted
+        return outline
+
+    def _generate_challenges(self, chapter_text, thesis):
+        """B6 反驳预演：对刚写完的章节生成质疑，用于注入下一章"""
+        prompt = f"""你是一位严格的产业分析师审稿人。请对以下章节内容提出 2-3 个具体的质疑或反驳角度。
+
+【章节内容】
+{chapter_text[:2000]}
+
+【中心论点】
+{thesis}
+
+要求：
+- 质疑必须具体（如"你没有解释为什么 X 会选择 Y 路径"），不能空泛（如"论证不够充分"）
+- 质疑应针对论证逻辑的薄弱点，不是事实错误
+- 每个质疑 1-2 句话
+
+严格输出JSON：
+{{
+    "challenges": ["质疑1", "质疑2", "质疑3"]
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是严格的审稿人。只输出JSON，不要解释。"},
+            {"role": "user", "content": prompt}
+        ], description="B6 Challenge Gen")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result and "challenges" in result:
+                challenges = result["challenges"]
+                logger.info(f"🎯 B6 反驳预演: {len(challenges)} 个质疑生成")
+                return challenges
+        return []
+
+    def _generate_title_candidates(self, article_text, thesis):
+        """B7 动态标题后置生成：基于全文重新生成标题候选，选择最有张力的"""
+        # 取文章前2000字作为上下文
+        snippet = article_text[:2000]
+
+        prompt = f"""你是一位资深产业媒体主编。请基于以下文章内容和中心论点，生成 3 个标题候选。
+
+【文章开头】
+{snippet}
+
+【中心论点】
+{thesis}
+
+要求：
+- 标题必须包含具体实体名（公司、技术、数据）
+- 标题必须有张力（不是"XXX行业分析"这种废话）
+- 每个标题标注张力评分 (1-10)
+
+严格输出JSON：
+{{
+    "titles": [
+        {{"title": "标题1", "tension": 8, "reason": "张力来源说明"}},
+        {{"title": "标题2", "tension": 7, "reason": "张力来源说明"}},
+        {{"title": "标题3", "tension": 9, "reason": "张力来源说明"}}
+    ]
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是资深媒体主编。只输出JSON，不要解释。"},
+            {"role": "user", "content": prompt}
+        ], description="B7 Title Gen")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result and "titles" in result:
+                candidates = result["titles"]
+                # 选择张力最高的
+                best = max(candidates, key=lambda x: x.get("tension", 0))
+                logger.info(
+                    f"🏷️ B7 标题候选: {[t.get('title', '') for t in candidates]} | "
+                    f"最佳: {best.get('title', '')} (张力{best.get('tension', '?')})"
+                )
+                return best.get("title", "")
+        return ""
+
+    def _annotate_freshness(self, facts_text):
+        """B13: 事实新鲜度标注 — 为搜索结果中的数据标注时效性"""
+        if not facts_text:
+            return facts_text
+        current_year = datetime.now().year
+        threshold_year = current_year - 1  # 去年及之后视为"时效良好"
+        text = re.sub(r'(\d{4})年(\d{1,2})月', lambda m:
+            f"{m.group(0)} [{'时效良好' if int(m.group(1)) >= threshold_year else '数据较旧，请谨慎引用'}]",
+            facts_text)
+        return text
+
+    def _append_related_reading(self, article_text, title):
+        """B11: 自动引用往期文章 — 匹配历史知识库中的相关文章"""
+        import glob
+        # 从文章中提取关键词
+        keywords = set()
+        # 用标题中的中文词和英文词作为关键词
+        for word in re.findall(r'[一-鿿]{2,}|[A-Za-z][a-zA-Z0-9]+', title):
+            keywords.add(word)
+        # 从 thesis 中也提取
+        thesis = self.state.get('thesis', '') or ''
+        for word in re.findall(r'[一-鿿]{2,}|[A-Za-z][a-zA-Z0-9]+', thesis):
+            if len(word) >= 3:
+                keywords.add(word)
+
+        if not keywords:
+            return article_text
+
+        related = []
+        for f in glob.glob(os.path.join(KB_ROOT, "**", "*.md"), recursive=True):
+            if self.today_str in f:
+                continue
+            fname = os.path.basename(f)
+            if any(kw.lower() in fname.lower() for kw in keywords):
+                # 提取可读标题
+                parts = fname.replace('.md', '').split('-', 3)
+                readable = parts[-1] if len(parts) > 3 else fname.replace('.md', '')
+                related.append(readable)
+
+        if related[:3]:
+            section = "\n\n---\n**往期相关阅读：**\n"
+            for r in related[:3]:
+                section += f"- {r}\n"
+            logger.info(f"📚 B11 往期引用: {len(related[:3])} 篇相关文章")
+            return article_text + section
+        return article_text
+
+    # ==================== C-series: 深度创意方法 ====================
+
+    def _generate_opening_hooks(self, thesis, outline, style, news_context):
+        """C8: 开篇钩子 A/B 生成"""
+        prompt = f"""为以下论点生成 3 个不同的开篇段落（每个 100-150 字）。
+
+论点：{thesis}
+第一章方向：{outline[0] if outline else ''}
+风格：{style.get('name', '')}
+
+三种开篇风格：
+1. 数据冲击型：用一个惊人的数据或事实直接切入
+2. 场景切入型：用一个具体的产业场景或事件开头
+3. 反直觉型：抛出一个违反常识的观点
+
+严格输出JSON：
+{{
+    "hooks": [
+        {{"type": "数据冲击", "text": "开篇段落", "tension": 8}},
+        {{"type": "场景切入", "text": "开篇段落", "tension": 7}},
+        {{"type": "反直觉", "text": "开篇段落", "tension": 9}}
+    ]
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是资深主编。只输出JSON，不要解释。"},
+            {"role": "user", "content": prompt}
+        ], description="C8 Opening Hook Gen")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result and "hooks" in result:
+                hooks = result["hooks"]
+                best = max(hooks, key=lambda x: x.get("tension", 0))
+                logger.info(f"🎣 C8 开篇钩子: {len(hooks)} 个候选, 选中: {best.get('type', '?')} (张力{best.get('tension', '?')})")
+                return best.get("text", "")
+        return ""
+
+    def _score_thesis_strength(self, article_text, thesis):
+        """C2: 论点强度量化评分"""
+        prompt = f"""评估以下文章的论点强度。
+
+论点：{thesis}
+文章：{article_text[:3000]}
+
+严格输出JSON：
+{{
+    "overall_score": 8,
+    "claim_scores": [
+        {{"claim": "具体论断", "evidence": "strong/medium/weak/missing", "data_cited": true}}
+    ],
+    "logic_gaps": ["跳跃1"],
+    "missing_evidence": ["需要补充的证据"],
+    "verdict": "pass|needs_revision"
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是严格的产业分析审稿人。只输出JSON。"},
+            {"role": "user", "content": prompt}
+        ], description="C2 Thesis Scoring")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result:
+                score = result.get("overall_score", 0)
+                verdict = result.get("verdict", "pass")
+                logger.info(f"📊 C2 论点评分: {score}/10 | {verdict} | 逻辑跳跃: {len(result.get('logic_gaps', []))}")
+                return result
+        return None
+
+    def _validate_outline_alignment(self, article_text, original_outline):
+        """C3: 反向大纲验证"""
+        prompt = f"""从以下文章中提取实际的章节大纲（每章1句话概括）。
+
+文章：{article_text[:4000]}
+原定大纲：{json.dumps(original_outline, ensure_ascii=False)}
+
+严格输出JSON：
+{{
+    "actual_outline": ["第1章实际主题", "第2章实际主题"],
+    "drift_score": 0.3,
+    "drift_details": ["偏离说明"],
+    "verdict": "aligned|minor_drift|major_drift"
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是文章结构分析师。只输出JSON。"},
+            {"role": "user", "content": prompt}
+        ], description="C3 Outline Validation")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result:
+                drift = result.get("drift_score", 0)
+                verdict = result.get("verdict", "aligned")
+                logger.info(f"📐 C3 大纲验证: {verdict} (漂移{drift:.1f})")
+                if verdict == "major_drift":
+                    logger.warning(f"⚠️ C3 主题漂移严重: {result.get('drift_details', [])}")
+                return result
+        return None
+
+    def _predict_half_life(self, article_text, thesis):
+        """C4: 半衰期预测"""
+        prompt = f"""预测以下产业分析文章的时效性。
+
+论点：{thesis}
+文章开头：{article_text[:1500]}
+
+严格输出JSON：
+{{
+    "half_life": "hours|days|weeks|months",
+    "category": "breaking|analysis|deep_dive|reference",
+    "reason": "判断依据"
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是内容策略分析师。只输出JSON。"},
+            {"role": "user", "content": prompt}
+        ], description="C4 Half-life Prediction")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result:
+                logger.info(f"⏱️ C4 半衰期: {result.get('half_life', '?')} | 类型: {result.get('category', '?')}")
+                return result
+        return None
+
+    def _verify_claims(self, article_text):
+        """C5: 事实核查网"""
+        # Step 1: 提取可核查声明
+        extract_prompt = f"""从以下文章中提取 3-5 个可核查的关键数据声明（金额、百分比、时间节点、技术参数）。
+
+文章：{article_text[:3000]}
+
+严格输出JSON：
+{{
+    "claims": ["声明1", "声明2", "声明3"]
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是数据核查员。只输出JSON。"},
+            {"role": "user", "content": extract_prompt}
+        ], description="C5 Claim Extract")
+        self._llm_call_count += 1
+
+        if not response:
+            return None
+
+        result = extract_json_from_text(response)
+        if not result or "claims" not in result:
+            return None
+
+        claims = result["claims"][:5]
+        # Step 2: 对每个声明搜索验证
+        verification_results = []
+        for claim in claims:
+            search_result = self._search_jina_for_chapter(claim)
+            verification_results.append({
+                "claim": claim,
+                "source_snippet": search_result[:200] if search_result else "无搜索结果",
+            })
+
+        # Step 3: LLM 综合判断
+        verify_prompt = f"""核查以下声明的准确性。
+
+原始文章声明与搜索结果：
+{json.dumps(verification_results, ensure_ascii=False, indent=1)}
+
+严格输出JSON：
+{{
+    "results": [
+        {{"claim": "声明", "status": "verified|unverified|contradicted", "note": "说明"}}
+    ],
+    "overall_reliability": "high|medium|low"
+}}"""
+
+        verify_resp = call_ai_api([
+            {"role": "system", "content": "你是事实核查员。只输出JSON。"},
+            {"role": "user", "content": verify_prompt}
+        ], description="C5 Claim Verify")
+        self._llm_call_count += 1
+
+        if verify_resp:
+            vr = extract_json_from_text(verify_resp)
+            if vr:
+                contradicted = [r for r in vr.get("results", []) if r.get("status") == "contradicted"]
+                logger.info(f"🔍 C5 事实核查: 可靠性={vr.get('overall_reliability', '?')} | 矛盾={len(contradicted)}条")
+                return vr
+        return None
+
+    def _generate_closing_hook(self, article_text, thesis):
+        """C6: 文末互动钩子"""
+        prompt = f"""基于以下文章，生成 1 个文末钩子。
+
+论点：{thesis}
+文章结尾：{article_text[-800:]}
+
+要求：
+- 不是空泛的"值得持续关注"
+- 必须是具体的、有争议性的、能让读者想转发讨论的问题
+
+严格输出JSON：
+{{
+    "hook": "钩子文本（1-2句话）",
+    "type": "question|prediction|challenge"
+}}"""
+
+        response = call_ai_api([
+            {"role": "system", "content": "你是资深媒体主编。只输出JSON。"},
+            {"role": "user", "content": prompt}
+        ], description="C6 Closing Hook")
+        self._llm_call_count += 1
+
+        if response:
+            result = extract_json_from_text(response)
+            if result and "hook" in result:
+                logger.info(f"🪝 C6 互动钩子: {result.get('type', '?')} 类型")
+                return result["hook"]
+        return ""
+
+    def _check_competitor_overlap(self, title, competitor_text):
+        """C7: 竞品相似度检查"""
+        if not competitor_text:
+            return False
+        competitor_titles = re.findall(r'【(.+?)】|标题[：:](.+)', competitor_text)
+        for ct in competitor_titles:
+            ct_str = ct[0] or ct[1]
+            if ct_str and SequenceMatcher(None, title, ct_str).ratio() > 0.7:
+                logger.warning(f"⚠️ C7 与竞品文章相似度高: {ct_str}")
+                return True
+        return False
+
+    def _storytify_data(self, text):
+        """C14: 数据故事化 — 检测纯数据罗列，改写为故事化表达"""
+        # 匹配连续3个以上数据点的句子（逗号分隔的数字）
+        data_heavy_pattern = r'[^。\n]*(?:\d+\.?\d*[%亿万元美元]\D*){3,}[^。\n]*'
+        matches = re.findall(data_heavy_pattern, text)
+
+        if not matches:
+            return text
+
+        for match in matches[:3]:  # 最多改写3处
+            rewrite_prompt = f"""将以下纯数据罗列改写为故事化表达，保留所有数据但增加叙事张力。
+
+原文：{match}
+
+要求：
+- 保留所有原始数据
+- 增加因果关系或对比叙事
+- 不要添加原文没有的信息
+
+直接输出改写后的句子，不要JSON。"""
+
+            response = call_ai_api([
+                {"role": "system", "content": "你是产业文章改写专家。直接输出改写文本。"},
+                {"role": "user", "content": rewrite_prompt}
+            ], description="C14 Data Storytify")
+            self._llm_call_count += 1
+
+            if response and len(response) > 20:
+                text = text.replace(match, response.strip(), 1)
+
+        return text
+
+    def _check_citation_density(self, text):
+        """C16: 引用密度优化"""
+        data_patterns = r'\d+\.?\d*[%亿万元美元]|[0-9]{4}年|\$[\d.]+|第[一二三四五]季度'
+        data_count = len(re.findall(data_patterns, text))
+        word_count = len(text)
+        density = data_count / max(word_count / 1000, 1)
+
+        if density < 3:
+            logger.info(f"📊 C16 引用密度: {density:.1f}/千字 — 偏低，建议补充数据")
+            return {"status": "sparse", "density": density, "action": "add_data"}
+        elif density > 8:
+            logger.info(f"📊 C16 引用密度: {density:.1f}/千字 — 过密，建议增加分析段落")
+            return {"status": "overloaded", "density": density, "action": "add_analysis"}
+        logger.info(f"📊 C16 引用密度: {density:.1f}/千字 — 适中")
+        return {"status": "optimal", "density": density, "action": "none"}
 
     def _editorial_rewrite(self, full_text, thesis, narrative_thread, context_entities):
         """主编重写 + Gate 驱动重写循环 + 润色后校验"""
@@ -599,6 +1070,7 @@ class ArticleWriterV3:
 4. 按风格DNA锚点校准全文语感
 5. 消除明显的拼凑感
 6. 检查论点是否贯穿全文——如果某段与论点无关，重新组织使其服务于论点
+7. 删除跨章节的重复论述——如果同一事实、同一论点、同一数据在不同段落出现多次，只保留表述最好的一次，其余删除
 
 【风格DNA锚点】
 {self.style.get('dna_sample', '')}
@@ -632,8 +1104,9 @@ class ArticleWriterV3:
         base += """
 
 【输出要求】
-输出完整的重写后全文。不要添加小标题或章节号。
-硬核清单中的每一项都必须保留，否则视为任务失败。"""
+输出完整的重写后全文。保留原有的 ## 章节标题，不要添加额外的小标题或章节号。
+硬核清单中的每一项都必须保留，否则视为任务失败。
+如果发现同一论断出现两次以上，视为严重质量问题，必须删除重复项。"""
 
         return base
 
@@ -858,19 +1331,91 @@ class ArticleWriterV3:
     def _surgical_purify(self, text):
         return surgical_purify(text)
 
+    def _deduplicate_article(self, text):
+        """程序化去重：删除跨章节的重复段落和高度相似句子"""
+        logger.info("🔍 程序化去重检查...")
+        paragraphs = text.split('\n\n')
+        if len(paragraphs) <= 1:
+            return text
+
+        # Phase 1: 段落级去重 — 提取核心句，SequenceMatcher > 0.7 则删除后者
+        def _core_sentence(para):
+            """取段落中最后一个完整句作为代表"""
+            sentences = re.split(r'(?<=。)', para.strip())
+            for s in reversed(sentences):
+                s = s.strip()
+                if len(s) > 15:
+                    return s
+            return para.strip()[:80]
+
+        seen_cores = []
+        deduped = []
+        removed = 0
+        for para in paragraphs:
+            if not para.strip():
+                deduped.append(para)
+                continue
+            core = _core_sentence(para)
+            is_dup = False
+            for seen in seen_cores:
+                ratio = SequenceMatcher(None, core, seen).ratio()
+                if ratio > 0.7:
+                    is_dup = True
+                    removed += 1
+                    break
+            if not is_dup:
+                seen_cores.append(core)
+                deduped.append(para)
+
+        if removed:
+            logger.info(f"  🗑️ 段落去重：删除 {removed} 个重复段落")
+
+        result = '\n\n'.join(deduped)
+
+        # Phase 2: 句子级去重 — 同一句子出现两次以上只保留一次
+        sentences = re.split(r'(?<=。)', result)
+        seen_sentences = {}
+        sentence_deduped = []
+        sent_removed = 0
+        for sent in sentences:
+            s = sent.strip()
+            if len(s) < 15:
+                sentence_deduped.append(sent)
+                continue
+            # 用句子的前 40 字作为 fingerprint
+            fp = s[:40]
+            if fp in seen_sentences:
+                sent_removed += 1
+                continue
+            seen_sentences[fp] = True
+            sentence_deduped.append(sent)
+
+        if sent_removed:
+            logger.info(f"  🗑️ 句子去重：删除 {sent_removed} 个重复句子")
+
+        return ''.join(sentence_deduped)
+
     def _break_monotony(self, text):
-        """语义感知的段落打散"""
+        """长段落自动分段（基于长度的确定性拆分）"""
         logger.info("🔪 打破机器排版规律...")
-        new_text = ""
-        segments = text.split('。')
-        for i, seg in enumerate(segments):
-            new_text += seg
-            if i < len(segments) - 1:
-                new_text += "。"
-                # 仅在长段落中触发，概率 20%
-                if random.random() < 0.20 and len(seg) > 50 and not seg.endswith('\n'):
-                    new_text += "\n\n"
-        return re.sub(r'\n{3,}', '\n\n', new_text)
+        paragraphs = text.split('\n\n')
+        result = []
+        for para in paragraphs:
+            if len(para) > 400:
+                # 在句号处拆分，每 150+ 字组成一段
+                sentences = re.split(r'(?<=。)', para)
+                chunk, chunk_len = "", 0
+                for sent in sentences:
+                    chunk += sent
+                    chunk_len += len(sent)
+                    if chunk_len > 150 and chunk.rstrip().endswith('。'):
+                        result.append(chunk.strip())
+                        chunk, chunk_len = "", 0
+                if chunk.strip():
+                    result.append(chunk.strip())
+            else:
+                result.append(para)
+        return '\n\n'.join(result)
 
     def _native_chinese_polish(self, text):
         """抽取段落进行纯正中文语感修正"""
@@ -919,6 +1464,21 @@ class ArticleWriterV3:
         if not outline:
             outline = ["产业背景", "核心逻辑", "标的分析", "总结展望"]
 
+        # Resume: 如果 state 中有 B1 调整过的大纲，优先使用
+        if self.state.get('chapters_done') and self.state.get('outline'):
+            outline = self.state['outline']
+            logger.info(f"📌 恢复 B1 调整后的大纲: {len(outline)} 章 | {outline}")
+
+        # B2: 自适应章节数 — 根据素材密度调整大纲长度
+        suggested_chapter_count = topic.get('suggested_chapter_count')
+        if suggested_chapter_count and suggested_chapter_count != len(outline):
+            old_len = len(outline)
+            if suggested_chapter_count < len(outline):
+                # 精简：保留首尾，合并中间
+                outline = outline[:suggested_chapter_count - 1] + [outline[-1]]
+            # 不主动增加章节，因为素材不够支撑更多
+            logger.info(f"📐 B2 大纲调整: {old_len}章 → {len(outline)}章 (密度: {topic.get('density', '?')})")
+
         logger.info(f"📌 V3 论点: {thesis[:60]}...")
         logger.info(f"📌 V3 暗线: {narrative_thread}")
         logger.info(f"📌 V3 大纲 ({len(outline)} 章): {outline}")
@@ -931,19 +1491,56 @@ class ArticleWriterV3:
             logger.info(f"📝 选题类型: {topic_type}，已注入模板指令")
 
         # 保存到状态
+        self.state['thesis'] = thesis
         self.state['counter_argument'] = counter_argument
+
+        # B10: 竞品叙事差异化指令
+        consensus_angles = topic.get('consensus_angles', [])
+        differentiation_block = ""
+        if consensus_angles:
+            diff_lines = "\n".join(f"- 不要从「{a}」的角度写（这是市场共识，缺乏新意）" for a in consensus_angles)
+            differentiation_block = f"\n【差异化指令——避免以下写法】\n{diff_lines}\n"
+            logger.info(f"🎯 B10 差异化指令已注入: {len(consensus_angles)} 个共识角度")
+
+        # C13: 盲区分析 — 将被市场忽略的角度注入写作
+        blind_spots = topic.get('blind_spots', [])
+        blind_spot_block = ""
+        if blind_spots:
+            bs_lines = "\n".join(f"- 【{bs.get('angle', '')}】{bs.get('opportunity', '')}（证据：{bs.get('evidence', '')}）" for bs in blind_spots if bs.get('angle'))
+            if bs_lines:
+                blind_spot_block = f"\n【市场盲区——以下是被市场忽略但有新闻证据的角度，可作为差异化切入点】\n{bs_lines}\n"
+                logger.info(f"🔍 C13 盲区分析已注入: {len(blind_spots)} 个盲区")
 
         total_chapters = len(outline)
         chapters_done = self.state.get('chapters_done', [])
         context_summary = self.state.get('context_summary', {"logic": "", "entities": {"companies": [], "data_points": [], "claims": []}})
 
-        # 全局新闻素材池
-        news_bullets = []
-        for n in news_list[:15]:
+        # 新闻聚类结果（如果有）
+        news_clusters = topic.get('news_clusters', None)
+        outlier_ids = set()
+        chapter_news_map = {}  # {chapter_idx: set of item_ids}
+        if news_clusters:
+            for c in news_clusters.get("clusters", []):
+                if c.get("type") == "outlier":
+                    outlier_ids.update(c.get("item_ids", []))
+            for ch_idx, ch in enumerate(news_clusters.get("suggested_chapters", [])):
+                chapter_news_map[ch_idx] = set(ch.get("item_ids", []))
+            logger.info(f"📊 聚类过滤: 剔除 {len(outlier_ids)} 条离群新闻, 分配 {len(chapter_news_map)} 个章节素材组")
+
+        # 全局新闻素材池（剔除 outlier）
+        def _format_news_bullet(n):
             p = n.get('parsed', {})
             raw_snippet = n.get('snippet', '无原片段').replace('\n', ' ')
-            news_bullets.append(f"- 📰 【{p.get('title')}】\n  AI摘要: {p.get('summary')}\n  原始信源片段(极重要): {raw_snippet} (平台:{n.get('source_platform')})")
-        global_news = "\n".join(news_bullets)
+            return f"- 📰 【{p.get('title')}】\n  AI摘要: {p.get('summary')}\n  原始信源片段(极重要): {raw_snippet} (平台:{n.get('source_platform')})"
+
+        filtered_news = [n for n in news_list[:15] if n.get('final_index') not in outlier_ids]
+        all_news_bullets = [_format_news_bullet(n) for n in filtered_news]
+        global_news = "\n".join(all_news_bullets)
+
+        # 构建新闻 ID 到 bullet 的映射，用于按章节分配
+        news_bullet_by_id = {}
+        for n in news_list[:15]:
+            news_bullet_by_id[n.get('final_index')] = _format_news_bullet(n)
 
         # #19 变更检测门控
         self._check_data_freshness(news_list)
@@ -951,22 +1548,106 @@ class ArticleWriterV3:
         # #14 加载跨篇事实归档背景
         archive_context = self._build_archive_context()
 
-        # 1. 增量章节流式写作
-        for i in range(len(chapters_done), total_chapters):
+        # B3: 预建事实库 — 批量预搜索每个章节方向的事实（keyed by title to survive B1 outline adjustment）
+        fact_library = {}
+        for i, ch_title in enumerate(outline):
+            search_query = self._get_chapter_keywords(title, ch_title)
+            facts = self._search_jina_for_chapter(search_query)
+            fact_library[ch_title] = facts
+            logger.info(f"📚 B3 预建事实库: 第{i+1}章 [{ch_title}] → {len(facts)}字")
+        logger.info(f"📚 B3 事实库构建完成: {len(fact_library)} 章节")
+
+        # C8: 开篇钩子 A/B 生成（仅首次写作时生成，resume 时跳过以节省 LLM 调用）
+        opening_hook = None
+        if not chapters_done:
+            opening_hook = self._generate_opening_hooks(thesis, outline, self.style, global_news)
+            if opening_hook:
+                logger.info(f"🎣 C8 开篇钩子已生成")
+
+        # C1: 情绪曲线
+        narrative_arc = topic.get('narrative_arc', [])
+        arc_by_chapter = {}
+        for arc in narrative_arc:
+            arc_by_chapter[arc.get('chapter', 0)] = arc
+
+        # 1. 增量章节流式写作（while 循环：B1 可能在第1章后缩短大纲）
+        pending_challenges = []  # B6: 待注入下一章的反驳质疑
+        i = len(chapters_done)
+        while i < total_chapters:
             ch_title = outline[i]
             logger.info(f"✍️ V3 主笔组装: 第 {i+1}/{total_chapters} 章节: {ch_title}")
 
-            # 章节定向搜索
+            # 章节定向搜索（B3: 预建事实库 + 实时补充）
             search_query = self._get_chapter_keywords(title, ch_title)
-            chapter_facts = self._search_jina_for_chapter(search_query)
+            realtime_facts = self._search_jina_for_chapter(search_query)
+            prebuilt_facts = fact_library.get(ch_title, "")
+            # 合并：预建事实库为主，实时搜索为补充
+            if prebuilt_facts and realtime_facts:
+                chapter_facts = f"【预研事实】\n{prebuilt_facts}\n\n【实时补充】\n{realtime_facts}"
+            elif prebuilt_facts:
+                chapter_facts = prebuilt_facts
+            else:
+                chapter_facts = realtime_facts
+            # B13: 事实新鲜度标注
+            chapter_facts = self._annotate_freshness(chapter_facts)
             self.chapter_facts_pool.append(chapter_facts)
 
             # 构建 prompt
+            # B5: 查找章节推荐风格
+            chapter_style = None
+            if news_clusters:
+                for ch in news_clusters.get("suggested_chapters", []):
+                    if ch.get("chapter_theme") == ch_title or i in [idx for idx, c in enumerate(news_clusters.get("suggested_chapters", [])) if c == ch]:
+                        style_id = ch.get("recommended_style")
+                        if style_id and style_id in self.styles:
+                            chapter_style = self.styles[style_id]
+                            break
+
             sys_p, prev_facts, last_words = self._build_chapter_sys_prompt(
-                i, total_chapters, context_summary, thesis, narrative_thread, outline, template_inject
+                i, total_chapters, context_summary, thesis, narrative_thread, outline, template_inject, chapter_style
             )
 
-            user_p = f"""{archive_context + chr(10) if archive_context else ''}【全文思路参考】{', '.join(outline)}
+            # C8: 第1章用开篇钩子替代默认 last_words
+            if i == 0 and opening_hook and not chapters_done:
+                last_words = opening_hook
+
+            # C1: 情绪曲线注入
+            arc_hint = ""
+            if i + 1 in arc_by_chapter:
+                arc = arc_by_chapter[i + 1]
+                arc_hint = f"\n本章情绪基调：{arc.get('emotion', '')}。写作目标：{arc.get('purpose', '')}\n"
+
+            # 按章节分配新闻：优先用聚类分配的，否则用全局过滤池
+            if i in chapter_news_map:
+                ch_ids = chapter_news_map[i]
+                ch_news_bullets = [news_bullet_by_id[idx] for idx in ch_ids if idx in news_bullet_by_id]
+                chapter_news = "\n".join(ch_news_bullets) if ch_news_bullets else global_news
+                news_label = "【本章关联快讯】"
+            else:
+                chapter_news = global_news
+                news_label = "【全量近期快讯池】"
+
+            # B6: 反驳质疑注入
+            challenge_block = ""
+            if pending_challenges:
+                challenge_block = "\n【前文可能的薄弱点——请在本章回应这些质疑】\n" + "\n".join(f"- {c}" for c in pending_challenges) + "\n"
+
+            # B9: 章节权重自适应 — 根据信息量分配字数目标
+            weight_hint = ""
+            if news_clusters:
+                suggested_chs = news_clusters.get("suggested_chapters", [])
+                if i < len(suggested_chs):
+                    hint = suggested_chs[i].get("argument_hint", "")
+                    # 信息量越多，字数目标越高
+                    hint_len = len(hint)
+                    if hint_len > 60:
+                        weight_hint = "本章目标字数：约1500字（重点展开，充分论述）"
+                    elif hint_len > 30:
+                        weight_hint = "本章目标字数：约1000字（标准深度）"
+                    else:
+                        weight_hint = "本章目标字数：约600字（精炼收束，点到为止）"
+
+            user_p = f"""{archive_context + chr(10) if archive_context else ''}{differentiation_block}{blind_spot_block}【全文思路参考】{', '.join(outline)}
 【当前写作焦点】请重点围绕这个方向深入论述：{ch_title}
 
 【前文全文核心摘要】（用来理解整体逻辑，不要重复）：
@@ -975,12 +1656,14 @@ class ArticleWriterV3:
 【你必须承接的上一段结尾原文】：
 {last_words}
 
-{prev_facts}【全量近期快讯池】
-{global_news}
+{prev_facts}{news_label}
+{chapter_news}
 
 【本节独家硬核事实库】
 {chapter_facts}
-
+{challenge_block}
+{weight_hint}
+{arc_hint}
 【任务】
 立刻往下续写段落，直接输出正文。**没有任何小标题、粗体小标题或章节号！**
 用最平滑的过渡承接上一段结尾，用事实说话。
@@ -1017,23 +1700,41 @@ class ArticleWriterV3:
                         context_summary = self._merge_chapter_state(context_summary, chapter_state_from_regex)
                     else:
                         logger.info("📋 正则提取无结果，回退到 LLM 上下文摘要")
-                        context_summary = self._summarize_context(context_summary, chapter_content)
+                        context_summary = self._summarize_context(context_summary, clean_text)
 
                 # 优先级压缩
                 context_summary = self._compress_context(context_summary, i, total_chapters)
                 self.state['context_summary'] = context_summary
                 self._save_state()
                 emit_event("chapter_done", f"第 {i+1}/{total_chapters} 章完成", {"chars": len(clean_text)})
+
+                # B1 骨架审稿：写完第1章后审查并修正后续大纲
+                if i == 0 and total_chapters > 1:
+                    adjusted_outline = self._review_and_adjust_outline(clean_text, outline, thesis)
+                    if adjusted_outline != outline:
+                        outline = adjusted_outline
+                        total_chapters = len(outline)
+                        self.state['outline'] = outline
+                        self._save_state()
+                        logger.info(f"🔧 B1 大纲已更新: {len(outline)} 章 | {outline}")
+
+                # B6 反驳预演：每章写完后生成质疑，注入下一章
+                if i < total_chapters - 1:
+                    pending_challenges = self._generate_challenges(clean_text, thesis)
+                else:
+                    pending_challenges = []
+                i += 1  # while loop increment
             else:
                 logger.error(f"第 {i+1} 章节写作失败，中止 V3 流程。")
                 emit_event("chapter_failed", f"第 {i+1} 章写作失败")
                 return
 
-        # 2. 组装全文
+        # 2. 组装全文（带章节标题）
         logger.info("⚖️ V3 组装全文...")
         raw_full_article = f"# {title}\n\n"
-        for content in chapters_done:
-            raw_full_article += content.strip() + "\n\n"
+        for ch_idx, content in enumerate(chapters_done):
+            ch_heading = outline[ch_idx] if ch_idx < len(outline) else f"第{ch_idx+1}章"
+            raw_full_article += f"## {ch_heading}\n\n{content.strip()}\n\n"
 
         # 3. 主编重写 + 硬核校验
         logger.info("✍️ V3 主编重写+硬核校验...")
@@ -1041,13 +1742,54 @@ class ArticleWriterV3:
         entities = context_summary.get("entities", {}) if isinstance(context_summary, dict) else {}
         polished_article = self._editorial_rewrite(raw_full_article, thesis, narrative_thread, entities)
 
+        # 3.3 程序化去重
+        polished_article = self._deduplicate_article(polished_article)
+
+        # B7 动态标题后置生成
+        new_title = self._generate_title_candidates(polished_article, thesis)
+        if new_title:
+            polished_article = re.sub(r'^# .+', f'# {new_title}', polished_article, count=1)
+            title = new_title  # 更新标题用于后续存档
+            logger.info(f"🏷️ B7 标题已替换: {new_title}")
+
         # 3.5 #12 蓝图合规检测
         polished_article = self._blueprint_compliance_check(raw_full_article, polished_article, topic)
 
+        # C2: 论点强度量化评分
+        thesis_result = self._score_thesis_strength(polished_article, thesis)
+        if thesis_result and thesis_result.get("verdict") == "needs_revision":
+            gaps = thesis_result.get("logic_gaps", [])
+            missing = thesis_result.get("missing_evidence", [])
+            logger.warning(f"⚠️ C2 论点偏弱，逻辑跳跃: {gaps}, 缺失证据: {missing}")
+
+        # C3: 反向大纲验证
+        self._validate_outline_alignment(polished_article, outline)
+
+        # C5: 事实核查网
+        self._verify_claims(polished_article)
+
+        # C4: 半衰期预测
+        half_life = self._predict_half_life(polished_article, thesis)
+
+        # C7: 竞品相似度检查（暂未接入竞品文章数据源，留作未来扩展）
+
         # 4. 后处理
         polished_article = self._break_monotony(polished_article)
+        # C14: 数据故事化
+        polished_article = self._storytify_data(polished_article)
         polished_article = self._native_chinese_polish(polished_article)
         pure_article = self._surgical_purify(polished_article)
+
+        # C16: 引用密度检查
+        self._check_citation_density(pure_article)
+
+        # C6: 文末互动钩子
+        closing_hook = self._generate_closing_hook(pure_article, thesis)
+        if closing_hook:
+            pure_article = pure_article.rstrip() + f"\n\n---\n**留给你的问题：**\n{closing_hook}\n"
+
+        # B11: 自动引用往期文章
+        pure_article = self._append_related_reading(pure_article, title)
 
         # 5. 存档与分发
         year, month = datetime.now().strftime("%Y"), datetime.now().strftime("%m")

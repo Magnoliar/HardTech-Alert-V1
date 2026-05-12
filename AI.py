@@ -15,6 +15,34 @@ from topic_tracker import TopicTracker
 
 logger = logging.getLogger(__name__)
 
+_DIR = os.path.dirname(os.path.abspath(__file__))
+ALERT_SENT_STATE = os.path.join(_DIR, ".alert_sent_today.json")
+
+
+def _check_alert_sent_today():
+    """检查今天是否已发送过 alert 邮件"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not os.path.exists(ALERT_SENT_STATE):
+        return False
+    try:
+        with open(ALERT_SENT_STATE, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        return state.get("date") == today
+    except Exception:
+        return False
+
+
+def _mark_alert_sent():
+    """标记今天已发送 alert 邮件"""
+    now = datetime.now()
+    state = {"date": now.strftime("%Y-%m-%d"), "sent_at": now.strftime("%H:%M:%S")}
+    try:
+        with open(ALERT_SENT_STATE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"写入 alert 状态文件失败: {e}")
+
+
 # --- 功能函数 ---
 
 def fetch_batch_data(batch_items):
@@ -285,17 +313,32 @@ def process_and_send_alerts(json_filename, progress_callback=None):
         final_list_for_ai.append(item)
 
     top_news = final_list_for_ai[:15]
-    logger.info(f"📧 正在生成邮件摘要...")
-    email_summary = fetch_email_summary(top_news)
 
-    logger.info(f"📧 正在构建 HTML 邮件...")
-    html_content = build_html_email(final_data_by_category, email_summary)
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    brand = DOMAIN['brand']
-    brand_emoji = DOMAIN['brand_emoji']
-    logger.info(f"📧 正在发送每日精选邮件...")
-    send_email(f"{brand_emoji} {brand} {current_date} - 深度精选", html_content)
-    logger.info(f"📧 每日精选邮件发送完成")
+    # 保存 top_news 供 --skip-score / --article-only 复用
+    try:
+        top_news_file = os.path.join(_DIR, f"{datetime.now().strftime('%Y-%m-%d')}-top_news.json")
+        with open(top_news_file, 'w', encoding='utf-8') as f:
+            json.dump(top_news, f, ensure_ascii=False, indent=2)
+        logger.info(f"💾 top_news 已缓存: {os.path.basename(top_news_file)}")
+    except Exception as e:
+        logger.warning(f"缓存 top_news 失败（不影响主流程）: {e}")
+
+    # Alert 去重：今天已发送过则跳过，但仍返回评分结果
+    if _check_alert_sent_today():
+        logger.info("📧 今日已发送过 alert 邮件，跳过邮件发送")
+    else:
+        logger.info(f"📧 正在生成邮件摘要...")
+        email_summary = fetch_email_summary(top_news)
+
+        logger.info(f"📧 正在构建 HTML 邮件...")
+        html_content = build_html_email(final_data_by_category, email_summary)
+        current_date = datetime.now().strftime("%Y-%m-%d")
+        brand = DOMAIN['brand']
+        brand_emoji = DOMAIN['brand_emoji']
+        logger.info(f"📧 正在发送每日精选邮件...")
+        send_email(f"{brand_emoji} {brand} {current_date} - 深度精选", html_content)
+        _mark_alert_sent()
+        logger.info(f"📧 每日精选邮件发送完成")
 
     # --- 记录最终输出到话题历史 (反馈回路) ---
     if tracker:
